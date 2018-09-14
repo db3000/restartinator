@@ -19,6 +19,10 @@ class State(enum.Enum):
     POWERING_ON   = enum.auto()  # Waiting for switch to power on
     REBOOTING     = enum.auto()  # Waiting for device to power on
 
+class NotifyState(enum.Enum):
+    ONLINE  = enum.auto()
+    OFFLINE = enum.auto()
+
 EmailSettings = collections.namedtuple('EmailSettings',
                                        ['smtp_host', 'smtp_username',
                                         'smtp_password', 'use_ssl',
@@ -47,7 +51,7 @@ def notify(config, template, device, **kwargs):
             message['To'] = email_cfg.email_to
 
             sender = smtplib.SMTP_SSL if email_cfg.use_ssl else smtplib.SMTP
-            
+
             smtp = sender(email_cfg.smtp_host, timeout = SOCKET_TIMEOUT)
             smtp.login(email_cfg.smtp_username,
                        email_cfg.smtp_password)
@@ -63,31 +67,40 @@ def monitorDevice(config, device):
         state = State.AWAKE
         next_state = state
         retries = 0
-        plug = pyHS100.SmartPlug(device.plug_host)
-    
+        notify_state = NotifyState.ONLINE
+
         while True:
             previous_state = state
             state = next_state
-            
+
             if state == State.AWAKE:
                 try:
-                    socket.create_connection((device.host, device.port),
+                    host = socket.gethostbyname(device.host)
+                    socket.create_connection((host, device.port),
                                              SOCKET_TIMEOUT).close()
-                    if previous_state != State.AWAKE:
-                        log('Device is now up',  device = device)
+
+                    if notify_state != NotifyState.ONLINE:
+                        notify_state = NotifyState.ONLINE
                         notify(config,
                                '{device.name} is ONLINE',
                                device = device)
+
+                    if previous_state != state.AWAKE or retries > 0:
+                        log('Device is now up', device = device)
+
+                    retries = 0
                 except (socket.timeout, socket.error, ConnectionError):
                     log('No response, attempt {attempt}/{device.retries}',
                         device = device,
                         attempt = retries + 1)
-                
+
                     retries = retries + 1
                     if retries >= device.retries:
-                        notify(config,
-                               '{device.name} is OFFLINE',
-                               device = device)
+                        if notify_state != NotifyState.OFFLINE:
+                            notify_state = NotifyState.OFFLINE
+                            notify(config,
+                                   '{device.name} is OFFLINE',
+                                   device = device)
                         next_state = State.POWERING_OFF
                         continue
 
@@ -95,10 +108,11 @@ def monitorDevice(config, device):
 
             elif state == State.POWERING_OFF:
                 try:
-                    plug.turn_off()
+                    host = socket.gethostbyname(device.plug_host)
+                    pyHS100.SmartPlug(host).turn_off()
                     log('Powered off', device = device)
                     next_state = State.POWER_OFF
-                except pyHS100.SmartDeviceException as e:
+                except (pyHS100.SmartDeviceException, socket.error) as e:
                     log('Failed to power off: {exception}',
                         device = device,
                         exception = e)
@@ -112,13 +126,14 @@ def monitorDevice(config, device):
                     device = device)
                 time.sleep(device.cycle_time)
                 next_state = State.POWERING_ON
-            
+
             elif state == State.POWERING_ON:
                 try:
-                    plug.turn_on()
+                    host = socket.gethostbyname(device.plug_host)
+                    pyHS100.SmartPlug(host).turn_on()
                     log('Powered on', device = device)
                     next_state = State.REBOOTING
-                except pyHS100.SmartDeviceException as e:
+                except (pyHS100.SmartDeviceException, socket.error) as e:
                     log('Failed to power on: {exception}',
                         device = device,
                         exception = e)
@@ -136,8 +151,8 @@ def monitorDevice(config, device):
 
     except Exception as e:
         log('Got exception while monitoring: {exception}',
-               device = device,
-               exception = e)
+            device = device,
+            exception = e)
 
 if len(sys.argv) < 2:
     sys.exit(1)
@@ -159,9 +174,9 @@ devices = []
 for entry in input.get('devices', []):
    devices.append(
        Device(name = entry['name'],
-              host = socket.gethostbyname(entry['host']),
+              host = entry['host'],
               port = int(entry['port']),
-              plug_host = socket.gethostbyname(entry['plug_host']),
+              plug_host = entry['plug_host'],
               boot_time = int(entry.get('boot_time', 300)),
               check_interval = int(entry.get('check_interval', 30)),
               retries = int(entry.get('retries', 3)),
